@@ -67,6 +67,19 @@ comfy.ldm.minimax.model._mod_scale_shift = _mod_scale_shift
 comfy.ldm.minimax.model._mod_gate = _mod_gate
 
 
+def _pad_attn_bias_for_sdpa(mask, q):
+    # torch's memory-efficient SDPA backend (aten._efficient_attention_forward) requires
+    # attn_bias.stride(1) to be a multiple of 8. Our packed sequence length is arbitrary, so
+    # force alignment by allocating the mask's storage with the key dim padded, then handing
+    # back a narrowed view with the original (unpadded) logical shape.
+    nk = mask.shape[-1]
+    pad = (-nk) % 8
+    nq = q.shape[-2]
+    buf = torch.zeros((mask.shape[0], mask.shape[1], nq, nk + pad), dtype=mask.dtype, device=mask.device)
+    buf[..., :nk] = mask
+    return buf[..., :nk].expand(q.shape[0], q.shape[1], -1, -1)
+
+
 class Attention(nn.Module):
     def __init__(self, hidden, heads, head_dim, eps, dtype=None, device=None, operations=None):
         super().__init__()
@@ -97,6 +110,8 @@ class Attention(nn.Module):
         q = q.transpose(1, 2)
         k = k.transpose(1, 2)
         v = v.transpose(1, 2)
+        if attention_mask is not None:
+            attention_mask = _pad_attn_bias_for_sdpa(attention_mask, q)
         out = optimized_attention(q, k, v, self.heads, mask=attention_mask, skip_reshape=True, transformer_options=transformer_options)
         return self.out_proj(out)
 
