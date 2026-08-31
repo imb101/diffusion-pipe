@@ -71,13 +71,16 @@ def _pad_attn_bias_for_sdpa(mask, q):
     # torch's memory-efficient SDPA backend (aten._efficient_attention_forward) requires
     # attn_bias.stride(1) to be a multiple of 8. Our packed sequence length is arbitrary, so
     # force alignment by allocating the mask's storage with the key dim padded, then handing
-    # back a narrowed view with the original (unpadded) logical shape.
+    # back a narrowed view with the original (unpadded) logical shape. Keep the mask's other
+    # dims (e.g. a broadcastable query dim of 1) untouched -- materializing them against q's
+    # full sequence length here would blow up memory to O(seq_len^2) for long video sequences.
     nk = mask.shape[-1]
     pad = (-nk) % 8
-    nq = q.shape[-2]
-    buf = torch.zeros((mask.shape[0], mask.shape[1], nq, nk + pad), dtype=mask.dtype, device=mask.device)
+    if pad == 0:
+        return mask
+    buf = torch.zeros(*mask.shape[:-1], nk + pad, dtype=mask.dtype, device=mask.device)
     buf[..., :nk] = mask
-    return buf[..., :nk].expand(q.shape[0], q.shape[1], -1, -1)
+    return buf[..., :nk]
 
 
 class Attention(nn.Module):
@@ -91,6 +94,7 @@ class Attention(nn.Module):
         self.k_norm = operations.RMSNorm(head_dim, eps=eps, dtype=dtype, device=device)
         self.out_proj = operations.Linear(inner, hidden, bias=False, dtype=dtype, device=device)
 
+    @torch.compiler.disable
     def forward(self, x, rope_freqs=None, attention_mask=None, transformer_options={}):
         b, s = x.shape[:2]
         q, k, v = self.qkv_proj(x).split(self.heads * self.head_dim, dim=-1)
